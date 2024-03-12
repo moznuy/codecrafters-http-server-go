@@ -9,6 +9,94 @@ import (
 	"strings"
 )
 
+func root() string {
+	return "HTTP/1.1 200 OK\r\n\r\n"
+}
+
+var echoRe = regexp.MustCompile(`/echo/(?P<Resource>\S+)`)
+
+func echo(path string) string {
+	matches := echoRe.FindStringSubmatch(path)
+
+	if matches == nil {
+		panic("did not match")
+	}
+	resource := matches[1]
+	return fmt.Sprintf(
+		"HTTP/1.1 200 OK\r\n"+
+			"Content-Type: text/plain\r\n"+
+			"Content-Length: %v\r\n"+
+			"\r\n"+
+			"%s", len(resource), resource)
+}
+
+func userAgent(request Request) string {
+	m, exist := request.Headers["User-Agent"]
+	if !exist {
+		panic("no user-agent")
+	}
+	return fmt.Sprintf(
+		"HTTP/1.1 200 OK\r\n"+
+			"Content-Type: text/plain\r\n"+
+			"Content-Length: %v\r\n"+
+			"\r\n"+
+			"%s", len(m), m)
+}
+
+func routes(request Request) string {
+	if request.Path == "/" {
+		return root()
+	}
+	if request.Path == "/user-agent" {
+		return userAgent(request)
+	}
+	if echoRe.MatchString(request.Path) {
+		return echo(request.Path)
+	}
+	return "HTTP/1.1 404 Not Found\r\n\r\n"
+}
+
+type Request struct {
+	Path    string
+	Version string
+	Headers map[string]string
+}
+
+var requestRe = regexp.MustCompile(`GET (?P<Path>\S+) HTTP/(?P<Version>\S+)`)
+
+func ParseRequest(lines []string) Request {
+	firstLine := lines[0]
+	restLines := lines[1:]
+	matches := requestRe.FindStringSubmatch(firstLine)
+	if matches == nil {
+		panic("Could not parse HTTP first line")
+	}
+
+	return Request{
+		Path:    matches[1],
+		Version: matches[2],
+		Headers: ParseHeaders(restLines),
+	}
+}
+
+var headerRe = regexp.MustCompile(`(?P<Key>\S+): (?P<Value>\S+)`)
+
+func ParseHeaders(restLines []string) map[string]string {
+	result := make(map[string]string, len(restLines))
+	for _, line := range restLines {
+		if line == "" {
+			continue
+		}
+		match := headerRe.FindStringSubmatch(line)
+		if match == nil {
+			panic("Could not parse HTTP header")
+		}
+		// TODO: multimap
+		result[match[1]] = match[2]
+	}
+	return result
+}
+
 func main() {
 	fmt.Println("Listening on 0.0.0.0:4221")
 	l, err := net.Listen("tcp", "0.0.0.0:4221")
@@ -46,35 +134,9 @@ func main() {
 	}
 
 	lines := strings.Split(req, "\r\n")
-	//for _, line := range lines {
-	//	fmt.Printf("%s\n", line)
-	//}
-	r := regexp.MustCompile(`GET (?P<Path>\S+) HTTP/(?P<Version>\S+)`)
-	matches := r.FindStringSubmatch(lines[0])
-	if matches == nil {
-		fmt.Println("Could not parse HTTP header")
-		os.Exit(1)
-	}
-	path := matches[1]
-	resp := ""
-	if path == "/" {
-		resp = "HTTP/1.1 200 OK\r\n\r\n"
-	} else {
-		r := regexp.MustCompile(`/echo/(?P<Resource>\S+)`)
-		matches := r.FindStringSubmatch(path)
-		if matches == nil {
-			resp = "HTTP/1.1 404 Not Found\r\n\r\n"
-		} else {
-			resource := matches[1]
-			resp = fmt.Sprintf(
-				"HTTP/1.1 200 OK\r\n"+
-					"Content-Type: text/plain\r\n"+
-					"Content-Length: %v\r\n"+
-					"\r\n"+
-					"%s", len(resource), resource)
-		}
+	request := ParseRequest(lines)
 
-	}
+	resp := routes(request)
 
 	_, err = client.Write([]byte(resp))
 	if err != nil {
