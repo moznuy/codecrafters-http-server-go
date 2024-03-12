@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"flag"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -49,6 +51,19 @@ func files(request Request) {
 		panic("did not match")
 	}
 	filename := matches[1]
+
+	if strings.ToUpper(request.Method) == "POST" {
+		file, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			panic("open failed")
+		}
+		defer file.Close()
+		reader := bytes.NewReader(request.Body)
+		//TODO: handle err
+		io.Copy(file, reader)
+		request.writer.Write([]byte("HTTP/1.1 201 Created\r\n\r\n"))
+		return
+	}
 
 	info, err := os.Stat(filename)
 	if errors.Is(err, os.ErrNotExist) {
@@ -107,13 +122,15 @@ func routes(request Request) {
 }
 
 type Request struct {
+	Method  string
 	Path    string
 	Version string
 	Headers map[string]string
 	writer  io.Writer
+	Body    []byte
 }
 
-var requestRe = regexp.MustCompile(`GET (?P<Path>\S+) HTTP/(?P<Version>\S+)`)
+var requestRe = regexp.MustCompile(`(?P<Method>\S+) (?P<Path>\S+) HTTP/(?P<Version>\S+)`)
 
 func ParseRequest(lines []string, client net.Conn) Request {
 	firstLine := lines[0]
@@ -124,8 +141,9 @@ func ParseRequest(lines []string, client net.Conn) Request {
 	}
 
 	return Request{
-		Path:    matches[1],
-		Version: matches[2],
+		Method:  matches[1],
+		Path:    matches[2],
+		Version: matches[3],
 		Headers: ParseHeaders(restLines),
 		writer:  client,
 	}
@@ -200,9 +218,7 @@ func clientRead(clientId int, client net.Conn, done *atomic.Bool, wg *sync.WaitG
 	}()
 }
 
-func respond(req string, client net.Conn) {
-	lines := strings.Split(req, "\r\n")
-	request := ParseRequest(lines, client)
+func respond(request Request, client net.Conn) {
 	routes(request)
 
 	//_, err := client.Write([]byte(resp))
@@ -218,18 +234,41 @@ func respond(req string, client net.Conn) {
 }
 
 func readMessages(messages <-chan ClientMessage) {
-	requests := make(map[int]string)
+	requests := make(map[int][]byte)
 	for message := range messages {
 		req := requests[message.ClientId]
-		req += string(message.Data)
-		requests[message.ClientId] = req
+		requests[message.ClientId] = append(req, message.Data...)
+		cur_data := requests[message.ClientId]
 
-		if !strings.HasSuffix(req, "\r\n\r\n") {
+		slices := bytes.SplitAfterN(cur_data, []byte("\r\n\r\n"), 2)
+		if len(slices) < 2 {
 			continue
 		}
+		if len(slices) > 2 {
+			panic("wrong number of slices")
+		}
+
+		// TODO: only once:
+		header := string(slices[0])
+		lines := strings.Split(header, "\r\n")
+		request := ParseRequest(lines, message.Client)
+		lengthRaw, exist := request.Headers["Content-Length"]
+		if !exist {
+			lengthRaw = "0"
+		}
+		length, err := strconv.Atoi(lengthRaw)
+		if err != nil {
+			panic("Could not parse content-length")
+		}
+		if len(slices[1]) < length {
+			continue
+		}
+		// TODO: Reader instead of all body
+		request.Body = slices[1]
+
 		delete(requests, message.ClientId)
 		fmt.Println("Request parsing finished")
-		respond(req, message.Client)
+		respond(request, message.Client)
 	}
 }
 
