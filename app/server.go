@@ -5,6 +5,8 @@ import (
 	"io"
 	"net"
 	"os"
+	"regexp"
+	"strings"
 )
 
 func main() {
@@ -22,25 +24,55 @@ func main() {
 	}
 
 	var data [4096]byte
-	//for {
-	read, err := client.Read(data[:])
-	s := string(data[:read])
-	//fmt.Printf("read: %v %#v\n", read, data[:read])
-	fmt.Printf("%s", s)
-	if err != nil {
-		if err == io.EOF {
-			os.Exit(1) // break
+	req := ""
+	for {
+		read, err := client.Read(data[:])
+		s := string(data[:read])
+		//fmt.Printf("%s", s)
+		req += s
+		if strings.HasSuffix(req, "\r\n\r\n") {
+			fmt.Println("Request finished")
+			break
 		}
-		fmt.Println("Error reading connection: ", err.Error())
-		os.Exit(1)
+
+		if err != nil {
+			if err == io.EOF {
+				fmt.Println("Connection closed")
+				os.Exit(1) // break
+			}
+			fmt.Println("Error reading connection: ", err.Error())
+			os.Exit(1)
+		}
 	}
 
-	_, err = client.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
+	lines := strings.Split(req, "\r\n")
+	//for _, line := range lines {
+	//	fmt.Printf("%s\n", line)
+	//}
+	r := regexp.MustCompile(`GET (?P<Path>\S+) HTTP/(?P<Version>\S+)`)
+	matches := r.FindStringSubmatch(lines[0])
+	if r == nil {
+		fmt.Println("Could not parse HTTP header")
+		os.Exit(1)
+	}
+	path := matches[1]
+	resp := ""
+	if path == "/" {
+		resp = "HTTP/1.1 200 OK\r\n\r\n"
+	} else {
+		resp = "HTTP/1.1 404 Not Found\r\n\r\n"
+	}
+
+	_, err = client.Write([]byte(resp))
+	if err != nil {
+		fmt.Println("Error writing connection: ", err.Error())
+		os.Exit(1)
+	}
+	err = client.Close()
 	if err != nil {
 		fmt.Println("Error writing connection: ", err.Error())
 		os.Exit(1)
 	}
 
-	//}
 	fmt.Println("client disconnected")
 }
