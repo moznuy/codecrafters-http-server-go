@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"net"
@@ -15,62 +16,106 @@ import (
 	"time"
 )
 
-func root() string {
-	return "HTTP/1.1 200 OK\r\n\r\n"
+func root(request Request) {
+	//TODO: handle err
+	request.writer.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
 }
 
 var echoRe = regexp.MustCompile(`/echo/(?P<Resource>\S+)`)
+var filesRe = regexp.MustCompile(`/files/(?P<Filename>\S+)`)
 
-func echo(path string) string {
-	matches := echoRe.FindStringSubmatch(path)
+func echo(request Request) {
+	matches := echoRe.FindStringSubmatch(request.Path)
 
 	if matches == nil {
 		panic("did not match")
 	}
 	resource := matches[1]
-	return fmt.Sprintf(
+
+	response := fmt.Sprintf(
 		"HTTP/1.1 200 OK\r\n"+
 			"Content-Type: text/plain\r\n"+
 			"Content-Length: %v\r\n"+
 			"\r\n"+
 			"%s", len(resource), resource)
+	//TODO: handle err
+	request.writer.Write([]byte(response))
 }
 
-func userAgent(request Request) string {
+func files(request Request) {
+	matches := filesRe.FindStringSubmatch(request.Path)
+
+	if matches == nil {
+		panic("did not match")
+	}
+	filename := matches[1]
+
+	info, err := os.Stat(filename)
+	if errors.Is(err, os.ErrNotExist) {
+		//TODO: handle err
+		request.writer.Write([]byte("HTTP/1.1 404 Not Found\r\n\r\n"))
+		return
+	}
+
+	file, err := os.Open(filename)
+	if err != nil {
+		panic("open failed")
+	}
+	//TODO: handle err
+	defer file.Close()
+	//TODO: handle err
+	response := fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: %v\r\n\r\n", info.Size())
+	request.writer.Write([]byte(response))
+	//TODO: handle err
+	io.Copy(request.writer, file)
+}
+
+func userAgent(request Request) {
 	m, exist := request.Headers["User-Agent"]
 	if !exist {
 		panic("no user-agent")
 	}
-	return fmt.Sprintf(
+	response := fmt.Sprintf(
 		"HTTP/1.1 200 OK\r\n"+
 			"Content-Type: text/plain\r\n"+
 			"Content-Length: %v\r\n"+
 			"\r\n"+
 			"%s", len(m), m)
+	//TODO: handle err
+	request.writer.Write([]byte(response))
 }
 
-func routes(request Request) string {
+func routes(request Request) {
 	if request.Path == "/" {
-		return root()
+		root(request)
+		return
 	}
 	if request.Path == "/user-agent" {
-		return userAgent(request)
+		userAgent(request)
+		return
 	}
 	if echoRe.MatchString(request.Path) {
-		return echo(request.Path)
+		echo(request)
+		return
 	}
-	return "HTTP/1.1 404 Not Found\r\n\r\n"
+	if filesRe.MatchString(request.Path) {
+		files(request)
+		return
+	}
+	//TODO: handle err
+	request.writer.Write([]byte("HTTP/1.1 404 Not Found\r\n\r\n"))
 }
 
 type Request struct {
 	Path    string
 	Version string
 	Headers map[string]string
+	writer  io.Writer
 }
 
 var requestRe = regexp.MustCompile(`GET (?P<Path>\S+) HTTP/(?P<Version>\S+)`)
 
-func ParseRequest(lines []string) Request {
+func ParseRequest(lines []string, client net.Conn) Request {
 	firstLine := lines[0]
 	restLines := lines[1:]
 	matches := requestRe.FindStringSubmatch(firstLine)
@@ -82,6 +127,7 @@ func ParseRequest(lines []string) Request {
 		Path:    matches[1],
 		Version: matches[2],
 		Headers: ParseHeaders(restLines),
+		writer:  client,
 	}
 }
 
@@ -156,15 +202,15 @@ func clientRead(clientId int, client net.Conn, done *atomic.Bool, wg *sync.WaitG
 
 func respond(req string, client net.Conn) {
 	lines := strings.Split(req, "\r\n")
-	request := ParseRequest(lines)
-	resp := routes(request)
+	request := ParseRequest(lines, client)
+	routes(request)
 
-	_, err := client.Write([]byte(resp))
-	if err != nil {
-		fmt.Println("Error writing connection: ", err.Error())
-		return
-	}
-	err = client.Close()
+	//_, err := client.Write([]byte(resp))
+	//if err != nil {
+	//	fmt.Println("Error writing connection: ", err.Error())
+	//	return
+	//}
+	err := client.Close()
 	if err != nil {
 		fmt.Println("Error closing connection: ", err.Error())
 		return
@@ -199,6 +245,20 @@ func sigHandler(sigs <-chan os.Signal, listener net.Listener) {
 
 func main() {
 	sigs := make(chan os.Signal, 1)
+	dir := flag.String("directory", ".", "")
+	flag.Parse()
+	fmt.Printf("Working directory %q\n", *dir)
+
+	err := os.Chdir(*dir)
+	//entries, err := os.ReadDir("./")
+	//for _, e := range entries {
+	//	fmt.Println(e.Name())
+	//}
+
+	if err != nil {
+		fmt.Println("Error changing directory: ", err.Error())
+		os.Exit(1)
+	}
 
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	fmt.Println("Listening on 0.0.0.0:4221")
