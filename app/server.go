@@ -1,12 +1,18 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
+	"os/signal"
 	"regexp"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
 )
 
 func root() string {
@@ -97,57 +103,131 @@ func ParseHeaders(restLines []string) map[string]string {
 	return result
 }
 
+type ClientMessage struct {
+	ClientId int
+	Client   net.Conn
+	Data     []byte
+}
+
+func clientRead(clientId int, client net.Conn, done *atomic.Bool, wg *sync.WaitGroup, messages chan<- ClientMessage) {
+	//result := make(chan ClientMessage)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		var data [4096]byte
+		for {
+			if done.Load() {
+				fmt.Println("Done fired")
+				break
+			}
+			err := client.SetReadDeadline(time.Now().Add(10 * time.Second))
+			if err != nil {
+				fmt.Println("Error SetReadDeadline", err.Error())
+				os.Exit(1)
+			}
+			read, err := client.Read(data[:])
+			if read > 0 {
+				messages <- ClientMessage{
+					ClientId: clientId,
+					Client:   client,
+					Data:     data[:read],
+				}
+			}
+
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					fmt.Println("Connection closed")
+					return
+				}
+				if errors.Is(err, os.ErrDeadlineExceeded) {
+					fmt.Println("ErrDeadlineExceeded")
+					continue
+				}
+				if errors.Is(err, net.ErrClosed) {
+					fmt.Println("read: Connection closed")
+					break
+				}
+				fmt.Println("Error reading connection: ", err.Error())
+				os.Exit(1)
+			}
+		}
+	}()
+}
+
+func respond(req string, client net.Conn) {
+	lines := strings.Split(req, "\r\n")
+	request := ParseRequest(lines)
+	resp := routes(request)
+
+	_, err := client.Write([]byte(resp))
+	if err != nil {
+		fmt.Println("Error writing connection: ", err.Error())
+		return
+	}
+	err = client.Close()
+	if err != nil {
+		fmt.Println("Error closing connection: ", err.Error())
+		return
+	}
+}
+
+func readMessages(messages <-chan ClientMessage) {
+	requests := make(map[int]string)
+	for message := range messages {
+		req := requests[message.ClientId]
+		req += string(message.Data)
+		requests[message.ClientId] = req
+
+		if !strings.HasSuffix(req, "\r\n\r\n") {
+			continue
+		}
+		delete(requests, message.ClientId)
+		fmt.Println("Request parsing finished")
+		respond(req, message.Client)
+	}
+}
+
+func sigHandler(sigs <-chan os.Signal, listener net.Listener) {
+	<-sigs
+	fmt.Println("Close signal")
+	err := listener.Close()
+	if err != nil {
+		fmt.Println("Error closing listener: ", err.Error())
+		os.Exit(1)
+	}
+}
+
 func main() {
+	sigs := make(chan os.Signal, 1)
+
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	fmt.Println("Listening on 0.0.0.0:4221")
-	l, err := net.Listen("tcp", "0.0.0.0:4221")
+	listener, err := net.Listen("tcp", "0.0.0.0:4221")
 	if err != nil {
 		fmt.Println("Failed to bind to port 4221")
 		os.Exit(1)
 	}
+	go sigHandler(sigs, listener)
 
-	client, err := l.Accept()
-	if err != nil {
-		fmt.Println("Error accepting connection: ", err.Error())
-		os.Exit(1)
-	}
+	done := atomic.Bool{}
+	done.Store(false)
+	wg := sync.WaitGroup{}
+	clientMessages := make(chan ClientMessage)
+	go readMessages(clientMessages)
 
-	var data [4096]byte
-	req := ""
-	for {
-		read, err := client.Read(data[:])
-		s := string(data[:read])
-		//fmt.Printf("%s", s)
-		req += s
-		if strings.HasSuffix(req, "\r\n\r\n") {
-			fmt.Println("Request finished")
+	for clientID := 0; ; clientID += 1 {
+		client, err := listener.Accept()
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				fmt.Println("listen: Connection closed")
+				break
+			}
+			fmt.Println("Error accepting connection: ", err.Error())
 			break
 		}
 
-		if err != nil {
-			if err == io.EOF {
-				fmt.Println("Connection closed")
-				os.Exit(1) // break
-			}
-			fmt.Println("Error reading connection: ", err.Error())
-			os.Exit(1)
-		}
+		clientRead(clientID, client, &done, &wg, clientMessages)
 	}
-
-	lines := strings.Split(req, "\r\n")
-	request := ParseRequest(lines)
-
-	resp := routes(request)
-
-	_, err = client.Write([]byte(resp))
-	if err != nil {
-		fmt.Println("Error writing connection: ", err.Error())
-		os.Exit(1)
-	}
-	err = client.Close()
-	if err != nil {
-		fmt.Println("Error writing connection: ", err.Error())
-		os.Exit(1)
-	}
-
-	fmt.Println("client disconnected")
+	done.Store(true)
+	wg.Wait()
 }
