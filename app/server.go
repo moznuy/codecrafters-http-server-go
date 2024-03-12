@@ -51,7 +51,7 @@ func main() {
 	//}
 	r := regexp.MustCompile(`GET (?P<Path>\S+) HTTP/(?P<Version>\S+)`)
 	matches := r.FindStringSubmatch(lines[0])
-	if r == nil {
+	if matches == nil {
 		fmt.Println("Could not parse HTTP header")
 		os.Exit(1)
 	}
@@ -60,7 +60,20 @@ func main() {
 	if path == "/" {
 		resp = "HTTP/1.1 200 OK\r\n\r\n"
 	} else {
-		resp = "HTTP/1.1 404 Not Found\r\n\r\n"
+		r := regexp.MustCompile(`/echo/(?P<Resource>\S+)`)
+		matches := r.FindStringSubmatch(path)
+		if matches == nil {
+			resp = "HTTP/1.1 404 Not Found\r\n\r\n"
+		} else {
+			resource := matches[1]
+			resp = fmt.Sprintf(
+				"HTTP/1.1 200 OK\r\n"+
+					"Content-Type: text/plain\r\n"+
+					"Content-Length: %v\r\n"+
+					"\r\n"+
+					"%s", len(resource), resource)
+		}
+
 	}
 
 	_, err = client.Write([]byte(resp))
